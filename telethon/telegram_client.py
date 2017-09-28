@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 from mimetypes import guess_type
 from threading import Thread
+from time import sleep
+
 try:
     import socks
 except ImportError:
@@ -126,6 +128,18 @@ class TelegramClient(TelegramBareClient):
         self._phone_code_hash = None
         self._phone = None
 
+        # Despite the state of the real connection, keep track of whether
+        # the user has explicitly called .connect() or .disconnect() here.
+        # This information is required by the read thread, who will be the
+        # one attempting to reconnect on the background *while* the user
+        # doesn't explicitly call .disconnect(), thus telling it to stop
+        # retrying. The main thread, knowing there is a background thread
+        # attempting reconnection as soon as it happens, will just sleep.
+        self._user_connected = False
+
+        # Save whether the user is authorized here (a.k.a. logged in)
+        self._authorized = False
+
         # Uploaded files cache so subsequent calls are instant
         self._upload_cache = {}
 
@@ -148,9 +162,6 @@ class TelegramClient(TelegramBareClient):
 
            exported_auth is meant for internal purposes and can be ignored.
         """
-        if self._sender and self._sender.is_connected():
-            return
-
         if socks and self._recv_thread:
             # Treat proxy errors specially since they're not related to
             # Telegram itself, but rather to the proxy. If any happens on
@@ -164,34 +175,22 @@ class TelegramClient(TelegramBareClient):
         else:
             ok = super().connect(exported_auth=exported_auth)
 
-        # The main TelegramClient is the only one that will have
-        # constant_read, since it's also the only one who receives
-        # updates and need to be processed as soon as they occur.
-        #
-        # TODO Allow to disable this to avoid the creation of a new thread
-        # if the user is not going to work with updates at all? Whether to
-        # read constantly or not for updates needs to be known before hand,
-        # and further updates won't be able to be added unless allowing to
-        # switch the mode on the fly.
-        if ok:
-            self._recv_thread = Thread(
-                name='ReadThread', daemon=True,
-                target=self._recv_thread_impl
-            )
-            self._recv_thread.start()
-            if self.updates.polling:
-                self.sync_updates()
+        if not ok:
+            return False
 
-        return ok
+        self._user_connected = True
+        try:
+            self.sync_updates()
+            self._set_connected_and_authorized()
+        except UnauthorizedError:
+            self._authorized = False
+
+        return True
 
     def disconnect(self):
         """Disconnects from the Telegram server
            and stops all the spawned threads"""
-        if not self._sender or not self._sender.is_connected():
-            return
-
-        # The existing thread will close eventually, since it's
-        # only running while the MtProtoSender.is_connected()
+        self._user_connected = False
         self._recv_thread = None
 
         # This will trigger a "ConnectionResetError", usually, the background
@@ -228,7 +227,7 @@ class TelegramClient(TelegramBareClient):
         if on_dc is None:
             client = TelegramBareClient(
                 self.session, self.api_id, self.api_hash,
-                proxy=self.proxy, timeout=timeout
+                proxy=self._sender.connection.conn.proxy, timeout=timeout
             )
             client.connect()
         else:
@@ -240,25 +239,29 @@ class TelegramClient(TelegramBareClient):
 
     # region Telegram requests functions
 
-    def invoke(self, request, *args, **kwargs):
-        """Invokes (sends) a MTProtoRequest and returns (receives) its result.
-           An optional 'retries' parameter can be set.
-
-           *args will be ignored.
+    def invoke(self, *requests, **kwargs):
+        """Invokes (sends) one or several MTProtoRequest and returns
+           (receives) their result. An optional named 'retries' parameter
+           can be used, indicating how many times it should retry.
         """
-        if self._on_read_thread():
-            raise AssertionError('Cannot invoke requests from the ReadThread')
+        # This is only valid when the read thread is reconnecting,
+        # that is, the connection lock is locked.
+        if self._on_read_thread() and not self._connect_lock.locked():
+            return  # Just ignore, we would be raising and crashing the thread
 
         self.updates.check_error()
 
         try:
-            # Users may call this method from within some update handler.
-            # If this is the case, then the thread invoking the request
-            # will be the one which should be reading (but is invoking the
-            # request) thus not being available to read it "in the background"
-            # and it's needed to call receive.
+            # We should call receive from this thread if there's no background
+            # thread reading or if the server disconnected us and we're trying
+            # to reconnect. This is because the read thread may either be
+            # locked also trying to reconnect or we may be said thread already.
+            call_receive = \
+                self._recv_thread is None or self._connect_lock.locked()
+
             return super().invoke(
-                request, call_receive=self._recv_thread is None,
+                *requests,
+                call_receive=call_receive,
                 retries=kwargs.get('retries', 5)
             )
 
@@ -267,8 +270,19 @@ class TelegramClient(TelegramBareClient):
                                'attempting to reconnect at DC {}'
                                .format(e.new_dc))
 
-            self.reconnect(new_dc=e.new_dc)
-            return self.invoke(request)
+            # TODO What happens with the background thread here?
+            # For normal use cases, this won't happen, because this will only
+            # be on the very first connection (not authorized, not running),
+            # but may be an issue for people who actually travel?
+            self._reconnect(new_dc=e.new_dc)
+            return self.invoke(*requests)
+
+        except ConnectionResetError as e:
+            if self._connect_lock.locked():
+                # We are connecting and we don't want to reconnect there...
+                raise
+            while self._user_connected and not self._reconnect():
+                sleep(0.1)  # Retry forever until we can send the request
 
     # Let people use client(SomeRequest()) instead client.invoke(...)
     __call__ = invoke
@@ -297,7 +311,7 @@ class TelegramClient(TelegramBareClient):
     def is_user_authorized(self):
         """Has the user been authorized yet
            (code request sent and confirmed)?"""
-        return self.session and self.get_me() is not None
+        return self._authorized
 
     def send_code_request(self, phone):
         """Sends a code request to the specified phone number"""
@@ -343,33 +357,37 @@ class TelegramClient(TelegramBareClient):
             except (PhoneCodeEmptyError, PhoneCodeExpiredError,
                     PhoneCodeHashEmptyError, PhoneCodeInvalidError):
                 return None
-
         elif password:
             salt = self(GetPasswordRequest()).current_salt
-            result = self(
-                CheckPasswordRequest(utils.get_password_hash(password, salt)))
-
+            result = self(CheckPasswordRequest(
+                utils.get_password_hash(password, salt)
+            ))
         elif bot_token:
             result = self(ImportBotAuthorizationRequest(
                 flags=0, bot_auth_token=bot_token,
-                api_id=self.api_id, api_hash=self.api_hash))
-
+                api_id=self.api_id, api_hash=self.api_hash
+            ))
         else:
             raise ValueError(
                 'You must provide a phone and a code the first time, '
-                'and a password only if an RPCError was raised before.')
+                'and a password only if an RPCError was raised before.'
+            )
 
+        self._set_connected_and_authorized()
         return result.user
 
     def sign_up(self, code, first_name, last_name=''):
         """Signs up to Telegram. Make sure you sent a code request first!"""
-        return self(SignUpRequest(
+        result = self(SignUpRequest(
             phone_number=self._phone,
             phone_code_hash=self._phone_code_hash,
             phone_code=code,
             first_name=first_name,
             last_name=last_name
-        )).user
+        ))
+
+        self._set_connected_and_authorized()
+        return result.user
 
     def log_out(self):
         """Logs out and deletes the current session.
@@ -1003,11 +1021,7 @@ class TelegramClient(TelegramBareClient):
            called automatically on connection if self.updates.enabled = True,
            otherwise it should be called manually after enabling updates.
         """
-        try:
-            self.updates.process(self(GetStateRequest()))
-            return True
-        except UnauthorizedError:
-            return False
+        self.updates.process(self(GetStateRequest()))
 
     def add_update_handler(self, handler):
         """Adds an update handler (a function which takes a TLObject,
@@ -1027,6 +1041,15 @@ class TelegramClient(TelegramBareClient):
 
     # Constant read
 
+    def _set_connected_and_authorized(self):
+        self._authorized = True
+        if self._recv_thread is None:
+            self._recv_thread = Thread(
+                name='ReadThread', daemon=True,
+                target=self._recv_thread_impl
+            )
+            self._recv_thread.start()
+
     # By using this approach, another thread will be
     # created and started upon connection to constantly read
     # from the other end. Otherwise, manual calls to .receive()
@@ -1035,7 +1058,7 @@ class TelegramClient(TelegramBareClient):
     #
     # This way, sending and receiving will be completely independent.
     def _recv_thread_impl(self):
-        while self._sender and self._sender.is_connected():
+        while self._user_connected:
             try:
                 if datetime.now() > self._last_ping + self._ping_delay:
                     self._sender.send(PingRequest(
@@ -1044,28 +1067,19 @@ class TelegramClient(TelegramBareClient):
                     self._last_ping = datetime.now()
 
                 self._sender.receive(update_state=self.updates)
-            except AttributeError:
-                # 'NoneType' object has no attribute 'receive'.
-                # The only moment when this can happen is reconnection
-                # was triggered from another thread and the ._sender
-                # was set to None, so close this thread and exit by return.
-                self._recv_thread = None
-                return
             except TimeoutError:
                 # No problem.
                 pass
             except ConnectionResetError:
-                if self._recv_thread is not None:
-                    # Do NOT attempt reconnecting unless the connection was
-                    # finished by the user -> ._recv_thread is None
-                    self._logger.debug('Server disconnected us. Reconnecting...')
-                    self._recv_thread = None  # Not running anymore
-                    self.reconnect()
-                    return
+                self._logger.debug('Server disconnected us. Reconnecting...')
+                while self._user_connected and not self._reconnect():
+                    sleep(0.1)  # Retry forever, this is instant messaging
+
             except Exception as e:
                 # Unknown exception, pass it to the main thread
                 self.updates.set_error(e)
-                self._recv_thread = None
-                return
+                break
+
+        self._recv_thread = None
 
     # endregion

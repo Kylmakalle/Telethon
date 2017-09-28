@@ -3,6 +3,7 @@ from datetime import timedelta
 from hashlib import md5
 from io import BytesIO
 from os import path
+from threading import Lock
 
 from . import helpers as utils
 from .crypto import rsa, CdnDecrypter
@@ -52,7 +53,7 @@ class TelegramBareClient:
     """
 
     # Current TelegramClient version
-    __version__ = '0.13.4'
+    __version__ = '0.14.1'
 
     # TODO Make this thread-safe, all connections share the same DC
     _dc_options = None
@@ -72,12 +73,18 @@ class TelegramBareClient:
         self.api_id = int(api_id)
         self.api_hash = api_hash
         if self.api_id < 20:  # official apps must use obfuscated
-            self._connection_mode = ConnectionMode.TCP_OBFUSCATED
-        else:
-            self._connection_mode = connection_mode
-        self.proxy = proxy
-        self._timeout = timeout
+            connection_mode = ConnectionMode.TCP_OBFUSCATED
+
+        self._sender = MtProtoSender(self.session, Connection(
+            self.session.server_address, self.session.port,
+            mode=connection_mode, proxy=proxy, timeout=timeout
+        ))
+
         self._logger = logging.getLogger(__name__)
+
+        # Two threads may be calling reconnect() when the connection is lost,
+        # we only want one to actually perform the reconnection.
+        self._connect_lock = Lock()
 
         # Cache "exported" senders 'dc_id: TelegramBareClient' and
         # their corresponding sessions not to recreate them all
@@ -87,9 +94,6 @@ class TelegramBareClient:
         # This member will process updates if enabled.
         # One may change self.updates.enabled at any later point.
         self.updates = UpdateState(process_updates)
-
-        # These will be set later
-        self._sender = None
 
     # endregion
 
@@ -104,21 +108,14 @@ class TelegramBareClient:
            If 'exported_auth' is not None, it will be used instead to
            determine the authorization key for the current session.
         """
-        if self.is_connected():
-            return True
-
-        connection = Connection(
-            self.session.server_address, self.session.port,
-            mode=self._connection_mode, proxy=self.proxy, timeout=self._timeout
-        )
-
         try:
+            self._sender.connect()
             if not self.session.auth_key:
                 # New key, we need to tell the server we're going to use
                 # the latest layer
                 try:
                     self.session.auth_key, self.session.time_offset = \
-                        authenticator.do_authentication(connection)
+                        authenticator.do_authentication(self._sender.connection)
                 except BrokenAuthKeyError:
                     return False
 
@@ -127,9 +124,6 @@ class TelegramBareClient:
                 init_connection = True
             else:
                 init_connection = self.session.layer != LAYER
-
-            self._sender = MtProtoSender(connection, self.session)
-            self._sender.connect()
 
             if init_connection:
                 if exported_auth is not None:
@@ -166,7 +160,7 @@ class TelegramBareClient:
             return False
 
     def is_connected(self):
-        return self._sender is not None and self._sender.is_connected()
+        return self._sender.is_connected()
 
     def _init_connection(self, query=None):
         result = self(InvokeWithLayerRequest(LAYER, InitConnectionRequest(
@@ -185,26 +179,34 @@ class TelegramBareClient:
 
     def disconnect(self):
         """Disconnects from the Telegram server"""
-        if self._sender:
-            self._sender.disconnect()
-            self._sender = None
+        self._sender.disconnect()
 
-    def reconnect(self, new_dc=None):
-        """Disconnects and connects again (effectively reconnecting).
+    def _reconnect(self, new_dc=None):
+        """If 'new_dc' is not set, only a call to .connect() will be made
+           since it's assumed that the connection has been lost and the
+           library is reconnecting.
 
-           If 'new_dc' is not None, the current authorization key is
-           removed, the DC used is switched, and a new connection is made.
+           If 'new_dc' is set, the client is first disconnected from the
+           current data center, clears the auth key for the old DC, and
+           connects to the new data center.
         """
-        self.disconnect()
-
-        if new_dc is not None:
+        if new_dc is None:
+            # Assume we are disconnected due to some error, so connect again
+            with self._connect_lock:
+                # Another thread may have connected again, so check that first
+                if not self.is_connected():
+                    return self.connect()
+                else:
+                    return True
+        else:
+            self.disconnect()
             self.session.auth_key = None  # Force creating new auth_key
             dc = self._get_dc(new_dc)
-            self.session.server_address = dc.ip_address
-            self.session.port = dc.port
+            ip = dc.ip_address
+            self._sender.connection.ip = self.session.server_address = ip
+            self._sender.connection.port = self.session.port = dc.port
             self.session.save()
-
-        self.connect()
+            return self.connect()
 
     # endregion
 
@@ -274,7 +276,8 @@ class TelegramBareClient:
             session.port = dc.port
             client = TelegramBareClient(
                 session, self.api_id, self.api_hash,
-                timeout=self._timeout
+                proxy=self._sender.connection.conn.proxy,
+                timeout=self._sender.connection.get_timeout()
             )
             client.connect(exported_auth=export_auth)
 
@@ -287,7 +290,7 @@ class TelegramBareClient:
 
     # region Invoking Telegram requests
 
-    def invoke(self, request, call_receive=True, retries=5):
+    def invoke(self, *requests, call_receive=True, retries=5):
         """Invokes (sends) a MTProtoRequest and returns (receives) its result.
 
            If 'updates' is not None, all read update object will be put
@@ -297,29 +300,31 @@ class TelegramBareClient:
            thread calling to 'self._sender.receive()' running or this method
            will lock forever.
         """
-        if not isinstance(request, TLObject) and not request.content_related:
+        if not all(isinstance(x, TLObject) and
+                   x.content_related for x in requests):
             raise ValueError('You can only invoke requests, not types!')
-
-        if not self._sender:
-            raise ValueError('You must be connected to invoke requests!')
 
         if retries <= 0:
             raise ValueError('Number of retries reached 0.')
 
         try:
             # Ensure that we start with no previous errors (i.e. resending)
-            request.confirm_received.clear()
-            request.rpc_error = None
+            for x in requests:
+                x.confirm_received.clear()
+                x.rpc_error = None
 
-            self._sender.send(request)
+            self._sender.send(*requests)
             if not call_receive:
                 # TODO This will be slightly troublesome if we allow
                 # switching between constant read or not on the fly.
                 # Must also watch out for calling .read() from two places,
                 # in which case a Lock would be required for .receive().
-                request.confirm_received.wait()  # TODO Socket's timeout here?
+                for x in requests:
+                    x.confirm_received.wait(
+                        self._sender.connection.get_timeout()
+                    )
             else:
-                while not request.confirm_received.is_set():
+                while not all(x.confirm_received.is_set() for x in requests):
                     self._sender.receive(update_state=self.updates)
 
         except TimeoutError:
@@ -328,20 +333,25 @@ class TelegramBareClient:
         except ConnectionResetError:
             self._logger.debug('Server disconnected us. Reconnecting and '
                                'resending request...')
-            self.reconnect()
+            self._reconnect()
 
         except FloodWaitError:
             self.disconnect()
             raise
 
-        if request.rpc_error:
-            raise request.rpc_error
-        if request.result is None:
-            return self.invoke(
-                request, call_receive=call_receive, retries=(retries - 1)
-            )
-        else:
-            return request.result
+        try:
+            raise next(x.rpc_error for x in requests if x.rpc_error)
+        except StopIteration:
+            if any(x.result is None for x in requests):
+                # "A container may only be accepted or
+                #  rejected by the other party as a whole."
+                return self.invoke(
+                    *requests, call_receive=call_receive, retries=(retries - 1)
+                )
+            elif len(requests) == 1:
+                return requests[0].result
+            else:
+                return [x.result for x in requests]
 
     # Let people use client(SomeRequest()) instead client.invoke(...)
     __call__ = invoke

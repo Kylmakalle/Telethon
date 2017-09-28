@@ -17,7 +17,6 @@ class CdnDecrypter:
         self.file_token = file_token
         self.cdn_aes = cdn_aes
         self.cdn_file_hashes = cdn_file_hashes
-        self.shaes = [sha256() for _ in range(len(cdn_file_hashes))]
 
     @staticmethod
     def prepare_decrypter(client, client_cls, cdn_redirect):
@@ -42,7 +41,7 @@ class CdnDecrypter:
         session.port = dc.port
         cdn_client = client_cls(  # Avoid importing TelegramBareClient
             session, client.api_id, client.api_hash,
-            timeout=client._timeout
+            timeout=client._sender.connection.get_timeout()
         )
         # This will make use of the new RSA keys for this specific CDN.
         #

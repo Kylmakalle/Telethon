@@ -248,14 +248,16 @@ class TLArg:
         result = {
             'int': 'int',
             'long': 'int',
+            'int128': 'int',
+            'int256': 'int',
             'string': 'str',
-            'date': 'datetime.datetime',
+            'date': 'datetime.datetime | None',  # None date = 0 timestamp
             'bytes': 'bytes',
             'true': 'bool',
         }.get(self.type, 'TLObject')
         if self.is_vector:
             result = 'list[{}]'.format(result)
-        if self.is_flag:
+        if self.is_flag and self.type != 'date':
             result += ' | None'
 
         return result
