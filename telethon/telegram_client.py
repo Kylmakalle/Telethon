@@ -97,6 +97,7 @@ class TelegramClient(TelegramBareClient):
              lang_code        = 'en'
              system_lang_code = lang_code
              report_errors    = True
+             session_path = /path/to/session/
         """
         if not api_id or not api_hash:
             raise PermissionError(
@@ -105,7 +106,10 @@ class TelegramClient(TelegramBareClient):
 
         # Determine what session object we have
         if isinstance(session, str) or session is None:
-            session = Session.try_load_or_create_new(session)
+            if kwargs.get('session_path'):
+                session = Session.try_load_or_create_new(session, os.path.join(kwargs.get('session_path'), ''))
+            else:
+                session = Session.try_load_or_create_new(session)
         elif not isinstance(session, Session):
             raise ValueError(
                 'The given session must be a str or a Session instance.')

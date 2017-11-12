@@ -17,12 +17,13 @@ class Session:
        If you think the session has been compromised, close all the sessions
        through an official Telegram client to revoke the authorization.
     """
-    def __init__(self, session_user_id):
+    def __init__(self, session_user_id, session_path):
         """session_user_id should either be a string or another Session.
            Note that if another session is given, only parameters like
            those required to init a connection will be copied.
         """
         # These values will NOT be saved
+        self.session_path = session_path
         if isinstance(session_user_id, Session):
             self.session_user_id = None
 
@@ -57,16 +58,16 @@ class Session:
         self._last_msg_id = 0  # Long
 
         # These values will be saved
-        self.server_address = '91.108.56.165'
+        self.server_address = '149.154.167.50'
         self.port = 443
         self.auth_key = None
         self.layer = 0
         self.salt = 0  # Unsigned long
 
     def save(self):
-        """Saves the current session object as session_user_id.session"""
+        """Saves the current session object as session_path/session_user_id.session"""
         if self.session_user_id:
-            with open('{}.session'.format(self.session_user_id), 'w') as file:
+            with open(self.session_path + '{}.session'.format(self.session_user_id), 'w') as file:
                 json.dump({
                     'port': self.port,
                     'salt': self.salt,
@@ -80,7 +81,7 @@ class Session:
     def delete(self):
         """Deletes the current session file"""
         try:
-            os.remove('{}.session'.format(self.session_user_id))
+            os.remove(self.session_path + '{}.session'.format(self.session_user_id))
             return True
         except OSError:
             return False
@@ -94,15 +95,18 @@ class Session:
                 for f in os.listdir('.') if f.endswith('.session')]
 
     @staticmethod
-    def try_load_or_create_new(session_user_id):
+    def try_load_or_create_new(session_user_id, session_path=''):
         """Loads a saved session_user_id.session or creates a new one.
            If session_user_id=None, later .save()'s will have no effect.
         """
         if session_user_id is None:
             return Session(None)
         else:
-            path = '{}.session'.format(session_user_id)
-            result = Session(session_user_id)
+            if session_path:
+                path = session_path + '{}.session'.format(session_user_id)
+            else:
+                path = '{}.session'.format(session_user_id)
+            result = Session(session_user_id, path)
             if not file_exists(path):
                 return result
 
