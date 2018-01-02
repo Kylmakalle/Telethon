@@ -654,7 +654,8 @@ class TelegramClient(TelegramBareClient):
                 ]
             else:
                 attributes = [DocumentAttributeFilename('unnamed')]
-
+            if 'file_name' in kwargs:
+                attributes = [DocumentAttributeFilename(kwargs['file_name'])]
             if 'is_voice_note' in kwargs:
                 attributes.append(DocumentAttributeAudio(0, voice=True))
 
